@@ -1,0 +1,713 @@
+// ==UserScript==
+// @name         Starter Office — менеджер баннеров (Sanity)
+// @namespace    starter-office-banners
+// @version      2.5.0
+// @description  Модалка с превью всех баннеров, статусами, настройками показа и drag-n-drop сортировкой напрямую через Sanity Content API
+// @author       you
+// @match        https://my.starterapp.ru/*
+// @icon         https://www.sanity.io/favicon.ico
+// @grant        none
+// @run-at       document-idle
+// @updateURL    https://raw.githubusercontent.com/Gnomophile/sanity-banners/main/sanity-banners-manager.user.js
+// @downloadURL  https://raw.githubusercontent.com/Gnomophile/sanity-banners/main/sanity-banners-manager.user.js
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // ==================== НАСТРОЙКИ ====================
+  const DATASET = 'production';
+  const API_VERSION = 'v2024-05-28';
+  const DOC_TYPE = 'banner';
+  const SORT_STEP = 100; // отступ от края при перемещении в самое начало/конец списка (абсолютное число не важно — важен только порядок)
+
+  // ==================== ОПРЕДЕЛЕНИЕ ПРОЕКТА (project id) ====================
+  // URL вида https://my.starterapp.ru/<project-alias>/... не содержит настоящий
+  // project id Sanity. Раньше он подсматривался через перехват fetch/XHR или
+  // Resource Timing API — оба способа либо ненадёжны (некоторые браузеры не
+  // отдают кросс-доменные записи ресурсов), либо (перехват fetch/XHR в связке
+  // с document-start) реально ломали загрузку JS-чанков самой студии.
+  //
+  // Правильный способ проще и безопаснее: сама студия вшивает project id прямо
+  // в HTML страницы — в инлайн-скрипте есть переменная SANITY_STUDIO_API_PROJECT_ID.
+  // Это просто чтение уже готового DOM, без единого дополнительного запроса и
+  // без вмешательства в чужой код.
+
+  let detectedProjectId = null;
+  const PROJECT_ID_KEY_PATTERN = /SANITY_STUDIO_API_PROJECT_ID["']?\s*[:=]\s*["']([a-z0-9]+)["']/i;
+
+  function extractProjectIdFromPage() {
+    const scripts = Array.from(document.scripts || []).filter((s) => !s.src);
+    for (const s of scripts) {
+      const m = s.textContent.match(PROJECT_ID_KEY_PATTERN);
+      if (m) return m[1];
+    }
+    return null;
+  }
+
+  async function waitForProjectId(timeoutMs = 8000) {
+    const start = Date.now();
+    while (!detectedProjectId) {
+      detectedProjectId = extractProjectIdFromPage();
+      if (detectedProjectId) break;
+      if (Date.now() - start > timeoutMs) {
+        throw new Error('Не удалось определить проект Sanity — обновите страницу студии и попробуйте снова');
+      }
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    return detectedProjectId;
+  }
+
+  function apiBase() {
+    return `https://${detectedProjectId}.api.sanity.io/${API_VERSION}`;
+  }
+
+  // ==================== ОПРЕДЕЛЕНИЕ МАРШРУТА ====================
+  // Кнопка нужна только на странице списка/карточки баннеров и глубже:
+  // /<project>/structure/static-item;banners[...]
+
+  function isBannersRoute() {
+    const parts = location.pathname.split('/').filter(Boolean);
+    if (parts.length < 3) return false;
+    if (parts[1] !== 'structure') return false;
+    return parts[2].startsWith('static-item;banners');
+  }
+
+  // ==================== СЕТЕВЫЕ ЗАПРОСЫ ====================
+
+  async function groqQuery(query) {
+    await waitForProjectId();
+    const url = `${apiBase()}/data/query/${DATASET}?query=${encodeURIComponent(query)}`;
+    const res = await fetch(url, { credentials: 'include' });
+    if (!res.ok) throw new Error(`GROQ ${res.status}: ${await res.text()}`);
+    const data = await res.json();
+    return data.result;
+  }
+
+  async function mutate(mutations) {
+    await waitForProjectId();
+    const url = `${apiBase()}/data/mutate/${DATASET}`;
+    const res = await fetch(url, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mutations }),
+    });
+    if (!res.ok) throw new Error(`Mutate ${res.status}: ${await res.text()}`);
+    return res.json();
+  }
+
+  // Загружаем ВСЕ баннеры (и опубликованные, и черновики) одним запросом,
+  // без необходимости скроллить список в интерфейсе Sanity.
+  async function fetchBanners() {
+    const query = `*[_type=="${DOC_TYPE}"]{
+      _id,
+      title,
+      status,
+      showInApplication,
+      showInWeb,
+      sortIndex,
+      "thumbH": backgroundImage.asset->url,
+      "thumbV": verticalBackgroundImage.asset->url,
+      "venues": shops[]->{
+        "city": address.city.ru,
+        "street": address.street.ru,
+        "house": address.house.ru
+      }
+    }`;
+    const raw = await groqQuery(query);
+
+    const byBase = new Map();
+    for (const doc of raw) {
+      const isDraft = doc._id.startsWith('drafts.');
+      const baseId = isDraft ? doc._id.slice(7) : doc._id;
+      const existing = byBase.get(baseId) || {};
+      if (isDraft) existing.draft = doc;
+      else existing.published = doc;
+      byBase.set(baseId, existing);
+    }
+
+    const banners = [];
+    for (const [baseId, { draft, published }] of byBase.entries()) {
+      const current = draft || published;
+      banners.push({
+        baseId,
+        editId: current._id, // именно этот _id надо патчить
+        hasDraft: !!draft,
+        title: current.title || '(без названия)',
+        status: !!current.status,
+        showInApplication: current.showInApplication !== false,
+        showInWeb: current.showInWeb !== false,
+        sortIndex: typeof current.sortIndex === 'number' ? current.sortIndex : 0,
+        thumbH: current.thumbH || null,
+        thumbV: current.thumbV || null,
+        venues: formatVenues(current.venues),
+      });
+    }
+    banners.sort((a, b) => a.sortIndex - b.sortIndex);
+    return banners;
+  }
+
+  // Пустое поле «Заведения» в Sanity означает «показывать во всех заведениях» —
+  // в этом случае ничего не выводим на превью, чтобы не загромождать карточку.
+  // Если заведения указаны — собираем их адреса в короткие читаемые строки.
+  function formatVenues(rawVenues) {
+    if (!Array.isArray(rawVenues) || !rawVenues.length) return [];
+    return rawVenues
+      .filter(Boolean)
+      .map((v) => [v.city, v.street, v.house].filter(Boolean).map((s) => String(s).trim()).join(', '))
+      .filter(Boolean);
+  }
+
+  // Все изменения из этого инструмента пишутся ТОЛЬКО в черновик (drafts.<id>),
+  // опубликованный документ никогда не патчится напрямую — так публикация
+  // остаётся осознанным, ручным действием в самой студии («Опубликовать»),
+  // а не происходит незаметно в момент клика по превью.
+  //
+  // Если черновика ещё нет, перед патчем клонируем туда ПОЛНЫЙ опубликованный
+  // документ (createIfNotExists), чтобы не потерять остальные поля баннера —
+  // и только затем применяем нужные изменения (set) к этому черновику.
+
+  function cloneForDraft(fullDoc, draftId) {
+    const clone = { ...fullDoc, _id: draftId };
+    delete clone._rev;
+    delete clone._createdAt;
+    delete clone._updatedAt;
+    return clone;
+  }
+
+  // Патч одного баннера (один или несколько полей).
+  async function patchBanner(banner, fields) {
+    if (banner.hasDraft) {
+      await mutate([{ patch: { id: banner.editId, set: fields } }]);
+      return;
+    }
+    const publishedId = banner.editId;
+    const draftId = 'drafts.' + banner.baseId;
+    const fullDoc = await groqQuery(`*[_id=="${publishedId}"][0]`);
+    const mutations = [{ createIfNotExists: cloneForDraft(fullDoc, draftId) }, { patch: { id: draftId, set: fields } }];
+    await mutate(mutations);
+    banner.editId = draftId;
+    banner.hasDraft = true;
+  }
+
+  // Вычисляет новое значение sortIndex для баннера, вставленного на позицию newIndex
+  // в списке list (после того, как он уже переставлен в этой позиции).
+  // Берётся середина между соседями — как «150 между 100 и 200» — поэтому
+  // все ОСТАЛЬНЫЕ баннеры остаются с прежними значениями, какая бы схема
+  // нумерации (1,2,3 / 10,20,30 / 100,200,300) ни была на проекте раньше.
+  function computeInsertSort(list, newIndex) {
+    const prev = list[newIndex - 1];
+    const next = list[newIndex + 1];
+
+    if (!prev && !next) return SORT_STEP; // единственный баннер в списке
+    if (!prev) return next.sortIndex - SORT_STEP; // вставили в самое начало
+    if (!next) return prev.sortIndex + SORT_STEP; // вставили в самый конец
+
+    const mid = (prev.sortIndex + next.sortIndex) / 2;
+    if (mid > prev.sortIndex && mid < next.sortIndex) return mid;
+    // Соседи равны или стоят впритык (место для строгой середины кончилось,
+    // например много одинаковых sortIndex в старых данных) — присоединяемся
+    // к ним тем же значением. Это не хуже того, что уже было (порядок внутри
+    // такой группы и так не был однозначно определён), а других баннеров
+    // это не касается.
+    return prev.sortIndex;
+  }
+
+
+  // ==================== СТИЛИ ====================
+
+  const STYLE = `
+  #sob-nav-btn {
+    display: inline-flex; align-items: center; gap: 6px; margin-left: 4px;
+    background: #2276fc; color: #fff; border: none; border-radius: 6px;
+    padding: 0 14px; height: 33px; font-size: 13px; font-weight: 600; cursor: pointer;
+    font-family: inherit; white-space: nowrap;
+  }
+  #sob-nav-btn:hover { background: #1a63d9; }
+  #sob-fab {
+    position: fixed; bottom: 22px; right: 22px; z-index: 999998;
+    background: #2276fc; color: #fff; border: none; border-radius: 24px;
+    padding: 11px 18px; font-size: 13px; font-weight: 600; cursor: pointer;
+    box-shadow: 0 6px 18px rgba(34,118,252,.4);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  #sob-fab:hover { background: #1a63d9; }
+  #sob-overlay {
+    position: fixed; inset: 0; background: rgba(15, 17, 20, 0.55);
+    z-index: 999999; display: flex; align-items: center; justify-content: center;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  #sob-modal {
+    background: #fff; width: min(1280px, 96vw); height: min(88vh, 960px);
+    border-radius: 12px; box-shadow: 0 20px 60px rgba(0,0,0,.35);
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  #sob-header {
+    display: flex; align-items: center; gap: 12px; padding: 14px 18px;
+    border-bottom: 1px solid #e6e8eb; flex-shrink: 0;
+  }
+  #sob-header h2 { font-size: 16px; margin: 0; color: #1a1a1a; flex-shrink: 0; }
+  #sob-search {
+    flex: 1; padding: 8px 12px; border: 1px solid #d7dade; border-radius: 8px;
+    font-size: 13px; outline: none;
+  }
+  #sob-search:focus { border-color: #2276fc; }
+  .sob-filter-btn {
+    border: 1px solid #d7dade; background: #fff; border-radius: 8px; padding: 7px 12px;
+    font-size: 13px; cursor: pointer; color: #444; white-space: nowrap;
+  }
+  .sob-filter-btn.active { background: #2276fc; border-color: #2276fc; color: #fff; }
+  #sob-refresh, #sob-close {
+    border: 1px solid #d7dade; background: #fff; border-radius: 8px; width: 34px; height: 34px;
+    cursor: pointer; font-size: 15px; flex-shrink: 0; color: #444;
+  }
+  #sob-refresh:hover, #sob-close:hover, .sob-filter-btn:hover { background: #f2f4f6; }
+  #sob-hint {
+    padding: 8px 18px; font-size: 12px; color: #6b7280; background: #f7f8fa;
+    border-bottom: 1px solid #e6e8eb; flex-shrink: 0;
+  }
+  #sob-body { flex: 1; overflow-y: auto; padding: 16px 18px; background: #fafbfc; }
+  #sob-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 14px; align-items: start;
+  }
+  .sob-card {
+    background: #fff; border: 1px solid #e2e5e9; border-radius: 10px; overflow: hidden;
+    cursor: grab; position: relative; transition: box-shadow .15s, opacity .15s;
+    display: flex; flex-direction: column;
+  }
+  .sob-card:hover { box-shadow: 0 4px 14px rgba(0,0,0,.10); }
+  .sob-card.dragging { opacity: .35; }
+  .sob-card.drag-over { outline: 2px dashed #2276fc; outline-offset: -2px; }
+  .sob-thumbs { position: relative; background: #eef0f2; }
+  .sob-thumb-box {
+    width: 100%; display: flex; align-items: center; justify-content: center;
+    overflow: hidden; background: #e4e7eb;
+  }
+  .sob-thumb-box.h { height: 110px; }
+  .sob-thumb-box.v { height: 230px; }
+  .sob-thumb-box + .sob-thumb-box { border-top: 1px solid #d7dade; }
+  .sob-thumb-box img { max-width: 100%; max-height: 100%; object-fit: contain; display: block; }
+  .sob-thumb-label {
+    position: absolute; left: 6px; font-size: 9.5px; font-weight: 700; letter-spacing: .02em;
+    text-transform: uppercase; color: #fff; background: rgba(0,0,0,.55); padding: 2px 6px;
+    border-radius: 4px; pointer-events: none;
+  }
+  .sob-noimg {
+    color: #a3a9b1; font-size: 11px; text-align: center; padding: 8px; height: 110px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .sob-rank {
+    position: absolute; top: 6px; left: 6px; background: rgba(0,0,0,.62); color: #fff;
+    font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 20px; line-height: 1.5; z-index: 2;
+  }
+  .sob-status {
+    position: absolute; top: 6px; right: 6px; font-size: 10px; font-weight: 600;
+    padding: 2px 7px; border-radius: 20px; color: #fff; line-height: 1.5; z-index: 2;
+  }
+  .sob-status.on { background: #17a34a; }
+  .sob-status.off { background: #9aa1ab; }
+  .sob-draft-badge {
+    position: absolute; bottom: 6px; left: 6px; font-size: 10px; font-weight: 600;
+    padding: 2px 7px; border-radius: 20px; background: #f59e0b; color: #fff; z-index: 2;
+  }
+  .sob-body { padding: 9px 10px 10px; display: flex; flex-direction: column; gap: 7px; flex: 1; }
+  .sob-title {
+    font-size: 12.5px; font-weight: 600; color: #1a1a1a; line-height: 1.3;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+    min-height: 32px;
+  }
+  .sob-venues {
+    font-size: 10.5px; color: #6b7280; line-height: 1.35; margin-top: -3px;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .sob-toggles { display: flex; gap: 6px; flex-wrap: wrap; }
+  .sob-toggle {
+    font-size: 10.5px; padding: 3px 7px; border-radius: 6px; border: 1px solid #d7dade;
+    cursor: pointer; user-select: none; color: #6b7280; background: #f7f8fa;
+  }
+  .sob-toggle.on { background: #e7f0ff; border-color: #b6d1fb; color: #1a56c4; }
+  .sob-toggle:hover { filter: brightness(0.97); }
+  .sob-sortrow { display: flex; align-items: center; gap: 5px; margin-top: auto; }
+  .sob-sortval { font-size: 11px; color: #9aa1ab; flex: 1; }
+  .sob-move-btn {
+    width: 22px; height: 22px; border: 1px solid #d7dade; background: #fff; border-radius: 6px;
+    cursor: pointer; font-size: 11px; color: #444; display: flex; align-items: center; justify-content: center;
+    line-height: 1;
+  }
+  .sob-move-btn:hover { background: #f2f4f6; }
+  .sob-move-btn:disabled { opacity: .3; cursor: default; }
+  #sob-toast {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    background: #1a1a1a; color: #fff; padding: 10px 18px; border-radius: 8px; font-size: 13px;
+    z-index: 1000001; opacity: 0; transition: opacity .2s; pointer-events: none;
+  }
+  #sob-toast.show { opacity: 1; }
+  #sob-loading {
+    display: flex; align-items: center; justify-content: center; height: 100%;
+    color: #6b7280; font-size: 13px;
+  }
+  `;
+
+  function injectStyle() {
+    if (!document.head) return; // документ ещё не готов (document-start) — попробуем на следующем тике
+    if (document.getElementById('sob-style')) return;
+    const style = document.createElement('style');
+    style.id = 'sob-style';
+    style.textContent = STYLE;
+    document.head.appendChild(style);
+  }
+
+  // ==================== ВСПОМОГАТЕЛЬНОЕ ====================
+
+  let toastTimer = null;
+  function toast(msg, isError) {
+    let el = document.getElementById('sob-toast');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'sob-toast';
+      document.body.appendChild(el);
+    }
+    el.textContent = msg;
+    el.style.background = isError ? '#c0362c' : '#1a1a1a';
+    el.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => el.classList.remove('show'), 2500);
+  }
+
+  function cdnUrl(url, extra) {
+    if (!url) return null;
+    return url + (url.includes('?') ? '&' : '?') + extra;
+  }
+
+  function formatSort(value) {
+    // Округляем только для отображения — реальное значение, отправленное
+    // в Sanity, остаётся точным (это важно для вставки «между» соседями).
+    return Number.isInteger(value) ? String(value) : value.toFixed(4).replace(/0+$/, '').replace(/\.$/, '');
+  }
+
+  // ==================== МОДАЛКА ====================
+
+  let state = {
+    banners: [],
+    filter: 'all', // all | active | inactive
+    search: '',
+    saving: false,
+  };
+
+  function filteredBanners() {
+    let list = state.banners;
+    if (state.filter === 'active') list = list.filter((b) => b.status);
+    if (state.filter === 'inactive') list = list.filter((b) => !b.status);
+    if (state.search.trim()) {
+      const q = state.search.trim().toLowerCase();
+      list = list.filter((b) => b.title.toLowerCase().includes(q));
+    }
+    return list;
+  }
+
+  function renderGrid() {
+    const grid = document.getElementById('sob-grid');
+    if (!grid) return;
+    const list = filteredBanners();
+    const filtering = list.length !== state.banners.length;
+
+    grid.innerHTML = '';
+    list.forEach((banner) => {
+      const card = document.createElement('div');
+      card.className = 'sob-card';
+      card.draggable = !filtering; // сортировка доступна только когда не активны поиск/фильтр
+      card.dataset.baseId = banner.baseId;
+
+      const globalIndex = state.banners.indexOf(banner);
+      const hImg = cdnUrl(banner.thumbH, 'w=440&fit=max&auto=format');
+      const vImg = cdnUrl(banner.thumbV, 'w=300&fit=max&auto=format');
+
+      let thumbsHtml = '';
+      if (hImg) {
+        thumbsHtml += `<div class="sob-thumb-box h"><img src="${hImg}" loading="lazy" alt=""><span class="sob-thumb-label" style="bottom:4px;">гориз.</span></div>`;
+      }
+      if (vImg) {
+        thumbsHtml += `<div class="sob-thumb-box v"><img src="${vImg}" loading="lazy" alt=""><span class="sob-thumb-label" style="bottom:4px;">верт.</span></div>`;
+      }
+      if (!thumbsHtml) {
+        thumbsHtml = `<div class="sob-noimg">Нет превью</div>`;
+      }
+
+      const venuesHtml = banner.venues.length
+        ? `<div class="sob-venues" title="${banner.venues.join('; ').replace(/"/g, '&quot;')}">📍 ${banner.venues.join(' · ')}</div>`
+        : '';
+
+      card.innerHTML = `
+        <div class="sob-thumbs">
+          <div class="sob-rank">#${globalIndex + 1}</div>
+          <div class="sob-status ${banner.status ? 'on' : 'off'}">${banner.status ? 'Активен' : 'Неактивен'}</div>
+          ${banner.hasDraft ? `<div class="sob-draft-badge">есть черновик</div>` : ''}
+          ${thumbsHtml}
+        </div>
+        <div class="sob-body">
+          <div class="sob-title" title="${banner.title.replace(/"/g, '&quot;')}">${banner.title}</div>
+          ${venuesHtml}
+          <div class="sob-toggles">
+            <div class="sob-toggle site ${banner.showInWeb ? 'on' : ''}">🌐 Сайт</div>
+            <div class="sob-toggle app ${banner.showInApplication ? 'on' : ''}">📱 Прил.</div>
+          </div>
+          <div class="sob-sortrow">
+            <button class="sob-move-btn up" ${filtering || globalIndex === 0 ? 'disabled' : ''} title="${filtering ? 'Недоступно при активном поиске/фильтре' : 'Раньше в очереди'}">◀</button>
+            <button class="sob-move-btn down" ${filtering || globalIndex === state.banners.length - 1 ? 'disabled' : ''} title="${filtering ? 'Недоступно при активном поиске/фильтре' : 'Позже в очереди'}">▶</button>
+            <div class="sob-sortval">sort: ${formatSort(banner.sortIndex)}</div>
+          </div>
+        </div>
+      `;
+
+      card.querySelector('.sob-toggle.site').addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggleField(banner, 'showInWeb');
+      });
+      card.querySelector('.sob-toggle.app').addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggleField(banner, 'showInApplication');
+      });
+
+      card.querySelector('.sob-move-btn.up').addEventListener('click', (e) => {
+        e.stopPropagation();
+        moveBanner(globalIndex, globalIndex - 1);
+      });
+      card.querySelector('.sob-move-btn.down').addEventListener('click', (e) => {
+        e.stopPropagation();
+        moveBanner(globalIndex, globalIndex + 1);
+      });
+
+      card.addEventListener('dragstart', (e) => {
+        card.classList.add('dragging');
+        e.dataTransfer.setData('text/plain', String(globalIndex));
+        e.dataTransfer.effectAllowed = 'move';
+      });
+      card.addEventListener('dragend', () => card.classList.remove('dragging'));
+      card.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        card.classList.add('drag-over');
+      });
+      card.addEventListener('dragleave', () => card.classList.remove('drag-over'));
+      card.addEventListener('drop', (e) => {
+        e.preventDefault();
+        card.classList.remove('drag-over');
+        const from = Number(e.dataTransfer.getData('text/plain'));
+        const to = globalIndex;
+        if (from !== to) moveBanner(from, to);
+      });
+
+      grid.appendChild(card);
+    });
+
+    if (!list.length) {
+      grid.innerHTML = `<div style="grid-column:1/-1;text-align:center;color:#9aa1ab;padding:40px 0;">Ничего не найдено</div>`;
+    }
+  }
+
+  async function toggleField(banner, field) {
+    if (state.saving) return;
+    const prev = banner[field];
+    banner[field] = !prev;
+    renderGrid();
+    state.saving = true;
+    try {
+      await patchBanner(banner, { [field]: banner[field] });
+      renderGrid(); // чтобы сразу показать бейдж «черновик», если он появился
+      toast('Сохранено в черновик — не забудьте опубликовать в студии');
+    } catch (err) {
+      banner[field] = prev;
+      renderGrid();
+      toast('Ошибка сохранения: ' + err.message, true);
+    } finally {
+      state.saving = false;
+    }
+  }
+
+  async function moveBanner(fromIdx, toIdx) {
+    if (state.saving) return;
+    if (toIdx < 0 || toIdx >= state.banners.length) return;
+    const list = state.banners;
+    const [item] = list.splice(fromIdx, 1);
+    list.splice(toIdx, 0, item);
+
+    const newSort = computeInsertSort(list, toIdx);
+    item.sortIndex = newSort;
+    renderGrid();
+
+    state.saving = true;
+    toast('Сохраняю позицию…');
+    try {
+      await patchBanner(item, { sortIndex: newSort });
+      toast(`Готово: sort ${newSort} — остальные баннеры не тронуты`);
+      renderGrid();
+    } catch (err) {
+      toast('Ошибка сохранения порядка: ' + err.message, true);
+    } finally {
+      state.saving = false;
+    }
+  }
+
+  async function loadAndRender() {
+    const body = document.getElementById('sob-body');
+    body.innerHTML = `<div id="sob-loading">Загружаю баннеры…</div>`;
+    try {
+      // Общий страховочный таймаут — если что-то зависнет (например, сеть или
+      // прерванная навигация), модалка не будет висеть на «Загружаю…» вечно.
+      const timeout = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('Превышено время ожидания (12с)')), 12000)
+      );
+      state.banners = await Promise.race([fetchBanners(), timeout]);
+      body.innerHTML = `<div id="sob-grid"></div>`;
+      renderGrid();
+    } catch (err) {
+      body.innerHTML = `
+        <div id="sob-loading" style="flex-direction:column;gap:10px;">
+          <div>Ошибка загрузки: ${err.message}</div>
+          <button id="sob-retry" class="sob-filter-btn">Повторить</button>
+        </div>
+      `;
+      document.getElementById('sob-retry')?.addEventListener('click', loadAndRender);
+    }
+  }
+
+  function openModal() {
+    if (document.getElementById('sob-overlay')) return;
+    injectStyle();
+
+    const overlay = document.createElement('div');
+    overlay.id = 'sob-overlay';
+    overlay.innerHTML = `
+      <div id="sob-modal">
+        <div id="sob-header">
+          <h2>Баннеры</h2>
+          <input id="sob-search" type="text" placeholder="Поиск по названию…" />
+          <button class="sob-filter-btn active" data-filter="all">Все</button>
+          <button class="sob-filter-btn" data-filter="active">Активные</button>
+          <button class="sob-filter-btn" data-filter="inactive">Неактивные</button>
+          <button id="sob-refresh" title="Обновить">⟳</button>
+          <button id="sob-close" title="Закрыть">✕</button>
+        </div>
+        <div id="sob-hint">
+          Перетащите превью, чтобы изменить порядок, либо используйте кнопки ◀▶ (недоступны при активном поиске/фильтре — порядок в них
+          относится к полному списку, а не к отфильтрованному). Новое значение sort ставится ровно между соседями (например 150 между 100
+          и 200) — <b>меняется только у перемещённого баннера</b>, у остальных значения не трогаются, какая бы схема нумерации ни была
+          на проекте раньше. Клик по «🌐 Сайт» / «📱 Прил.» переключает видимость.
+          Все изменения сохраняются как <b>неопубликованные черновики</b> (бейдж «есть черновик» на карточке) — само не публикуется,
+          опубликуйте баннер вручную в студии, когда будете готовы.
+        </div>
+        <div id="sob-body"></div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) closeModal();
+    });
+    document.getElementById('sob-close').addEventListener('click', closeModal);
+    document.getElementById('sob-refresh').addEventListener('click', loadAndRender);
+
+    document.getElementById('sob-search').addEventListener('input', (e) => {
+      state.search = e.target.value;
+      renderGrid();
+    });
+
+    overlay.querySelectorAll('.sob-filter-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        overlay.querySelectorAll('.sob-filter-btn').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        state.filter = btn.dataset.filter;
+        renderGrid();
+      });
+    });
+
+    document.addEventListener('keydown', escListener);
+
+    loadAndRender();
+  }
+
+  function escListener(e) {
+    if (e.key === 'Escape') closeModal();
+  }
+
+  function closeModal() {
+    const overlay = document.getElementById('sob-overlay');
+    if (overlay) overlay.remove();
+    document.removeEventListener('keydown', escListener);
+  }
+
+  // ==================== КНОПКА В ШАПКЕ (рядом со Schedules) ====================
+  // Studio — это SPA: переход между Structure/Vision/Media/Schedules и между
+  // баннерами не перезагружает страницу, поэтому кнопку нужно постоянно
+  // держать синхронизированной с текущим маршрутом (опрос вместо разовой вставки).
+
+  function findNavContainer() {
+    const link = Array.from(document.querySelectorAll('a')).find(
+      (a) => a.textContent.trim() === 'Schedules'
+    );
+    return link ? link.parentElement : null;
+  }
+
+  function createNavButton() {
+    const btn = document.createElement('button');
+    btn.id = 'sob-nav-btn';
+    btn.type = 'button';
+    btn.textContent = '🖼 Баннеры';
+    btn.addEventListener('click', openModal);
+    return btn;
+  }
+
+  function createFallbackFab() {
+    const btn = document.createElement('button');
+    btn.id = 'sob-fab';
+    btn.type = 'button';
+    btn.textContent = '🖼 Баннеры: превью и сортировка';
+    btn.addEventListener('click', openModal);
+    return btn;
+  }
+
+  // Даём тулбару время отрисоваться (обычно доли секунды) и только если он
+  // так и не появился спустя разумное время — показываем плавающую кнопку.
+  // Раньше фолбэк показывался сразу и потом «мигал», перескакивая наверх —
+  // это и есть та вспышка кнопки внизу справа, которую было видно при обычной загрузке.
+  const FALLBACK_GRACE_MS = 2500;
+  let bannersRouteSince = null;
+
+  function syncButton() {
+    if (!document.body) return; // документ ещё не готов (document-start) — попробуем на следующем тике
+    const shouldShow = isBannersRoute();
+    const navBtn = document.getElementById('sob-nav-btn');
+    const fab = document.getElementById('sob-fab');
+
+    if (!shouldShow) {
+      bannersRouteSince = null;
+      if (navBtn) navBtn.remove();
+      if (fab) fab.remove();
+      return;
+    }
+
+    if (bannersRouteSince === null) bannersRouteSince = Date.now();
+
+    injectStyle();
+    const container = findNavContainer();
+
+    if (container) {
+      // Кнопка встраивается в шапку сразу после «Schedules».
+      if (fab) fab.remove();
+      if (!navBtn || navBtn.parentElement !== container) {
+        if (navBtn) navBtn.remove();
+        container.appendChild(createNavButton());
+      }
+      return;
+    }
+
+    // Тулбар ещё не отрисовался — ждём, не показывая ничего преждевременно.
+    if (Date.now() - bannersRouteSince > FALLBACK_GRACE_MS && !fab) {
+      document.body.appendChild(createFallbackFab());
+    }
+  }
+
+  setInterval(syncButton, 250);
+  syncButton();
+})();
