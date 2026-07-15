@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Starter Office — менеджер баннеров (Sanity)
 // @namespace    starter-office-banners
-// @version      2.5.0
+// @version      2.7.0
 // @description  Модалка с превью всех баннеров, статусами, настройками показа и drag-n-drop сортировкой напрямую через Sanity Content API
 // @author       you
 // @match        https://my.starterapp.ru/*
@@ -196,22 +196,80 @@
   // Берётся середина между соседями — как «150 между 100 и 200» — поэтому
   // все ОСТАЛЬНЫЕ баннеры остаются с прежними значениями, какая бы схема
   // нумерации (1,2,3 / 10,20,30 / 100,200,300) ни была на проекте раньше.
+  const MIN_SORT = 100; // минимальное допустимое значение сортировки на проекте
+
+  // Возвращает целое число для вставки строго между соседями (например 150
+  // между 100 и 200), либо null, если места для целого числа не осталось
+  // (соседи равны, стоят впритык, или упираемся в минимум 100) — в этом
+  // случае вызывающий код сделает полный пересчёт списка.
   function computeInsertSort(list, newIndex) {
     const prev = list[newIndex - 1];
     const next = list[newIndex + 1];
 
-    if (!prev && !next) return SORT_STEP; // единственный баннер в списке
-    if (!prev) return next.sortIndex - SORT_STEP; // вставили в самое начало
-    if (!next) return prev.sortIndex + SORT_STEP; // вставили в самый конец
+    if (!prev && !next) return MIN_SORT; // единственный баннер в списке
 
-    const mid = (prev.sortIndex + next.sortIndex) / 2;
-    if (mid > prev.sortIndex && mid < next.sortIndex) return mid;
-    // Соседи равны или стоят впритык (место для строгой середины кончилось,
-    // например много одинаковых sortIndex в старых данных) — присоединяемся
-    // к ним тем же значением. Это не хуже того, что уже было (порядок внутри
-    // такой группы и так не был однозначно определён), а других баннеров
-    // это не касается.
-    return prev.sortIndex;
+    if (!prev) {
+      // вставили в самое начало — но не ниже минимума
+      const candidate = Math.round(next.sortIndex - SORT_STEP);
+      if (candidate >= MIN_SORT && candidate < next.sortIndex) return candidate;
+      if (next.sortIndex > MIN_SORT) return MIN_SORT; // есть хоть немного места над полом
+      return null; // сосед и так уже на минимуме — целого места нет
+    }
+
+    if (!next) {
+      return Math.round(prev.sortIndex + SORT_STEP); // вставили в самый конец
+    }
+
+    const gap = next.sortIndex - prev.sortIndex;
+    if (gap >= 2) {
+      const mid = Math.round((prev.sortIndex + next.sortIndex) / 2);
+      if (mid > prev.sortIndex && mid < next.sortIndex) return mid;
+    }
+    // Соседи равны или стоят впритык (например много одинаковых sortIndex
+    // в старых данных, или после многих вставок) — целого числа между ними
+    // просто не существует.
+    return null;
+  }
+
+  // Перенумеровывает ВЕСЬ список целыми значениями с чистым шагом SORT_STEP,
+  // начиная с MIN_SORT (100, 200, 300 ...). Используется только как fallback,
+  // когда точечная вставка невозможна (см. computeInsertSort выше), либо по
+  // явному нажатию «Перенумеровать всё» — то есть когда без этого никак.
+  async function renumberAll(list) {
+    const changed = [];
+    list.forEach((banner, i) => {
+      const target = MIN_SORT + i * SORT_STEP;
+      if (target !== banner.sortIndex) changed.push({ banner, target });
+    });
+    if (!changed.length) return false;
+
+    // Баннеры без черновика — заранее одним запросом подтягиваем их полные
+    // опубликованные документы, чтобы клонировать в черновик.
+    const needIds = changed.filter((c) => !c.banner.hasDraft).map((c) => c.banner.editId);
+    let fullDocsById = {};
+    if (needIds.length) {
+      const idsList = needIds.map((id) => `"${id}"`).join(',');
+      const docs = await groqQuery(`*[_id in [${idsList}]]`);
+      docs.forEach((d) => { fullDocsById[d._id] = d; });
+    }
+
+    const mutations = [];
+    changed.forEach(({ banner, target }) => {
+      let targetId = banner.editId;
+      if (!banner.hasDraft) {
+        const draftId = 'drafts.' + banner.baseId;
+        const full = fullDocsById[banner.editId];
+        if (full) mutations.push({ createIfNotExists: cloneForDraft(full, draftId) });
+        targetId = draftId;
+        banner.editId = draftId;
+        banner.hasDraft = true;
+      }
+      mutations.push({ patch: { id: targetId, set: { sortIndex: target } } });
+      banner.sortIndex = target;
+    });
+
+    await mutate(mutations);
+    return true;
   }
 
 
@@ -305,7 +363,9 @@
   .sob-status {
     position: absolute; top: 6px; right: 6px; font-size: 10px; font-weight: 600;
     padding: 2px 7px; border-radius: 20px; color: #fff; line-height: 1.5; z-index: 2;
+    cursor: pointer; border: none; font-family: inherit;
   }
+  .sob-status:hover { filter: brightness(1.1); }
   .sob-status.on { background: #17a34a; }
   .sob-status.off { background: #9aa1ab; }
   .sob-draft-badge {
@@ -442,7 +502,7 @@
       card.innerHTML = `
         <div class="sob-thumbs">
           <div class="sob-rank">#${globalIndex + 1}</div>
-          <div class="sob-status ${banner.status ? 'on' : 'off'}">${banner.status ? 'Активен' : 'Неактивен'}</div>
+          <button class="sob-status ${banner.status ? 'on' : 'off'}" title="Клик — переключить активность">${banner.status ? 'Активен' : 'Неактивен'}</button>
           ${banner.hasDraft ? `<div class="sob-draft-badge">есть черновик</div>` : ''}
           ${thumbsHtml}
         </div>
@@ -461,6 +521,10 @@
         </div>
       `;
 
+      card.querySelector('.sob-status').addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggleField(banner, 'status');
+      });
       card.querySelector('.sob-toggle.site').addEventListener('click', (e) => {
         e.stopPropagation();
         toggleField(banner, 'showInWeb');
@@ -533,14 +597,33 @@
     list.splice(toIdx, 0, item);
 
     const newSort = computeInsertSort(list, toIdx);
-    item.sortIndex = newSort;
-    renderGrid();
-
     state.saving = true;
-    toast('Сохраняю позицию…');
+
+    if (newSort !== null) {
+      item.sortIndex = newSort;
+      renderGrid();
+      toast('Сохраняю позицию…');
+      try {
+        await patchBanner(item, { sortIndex: newSort });
+        toast(`Готово: sort ${newSort} — остальные баннеры не тронуты`);
+        renderGrid();
+      } catch (err) {
+        toast('Ошибка сохранения порядка: ' + err.message, true);
+      } finally {
+        state.saving = false;
+      }
+      return;
+    }
+
+    // Целого числа между соседями нет (упёрлись в минимум 100 или соседи
+    // стоят впритык/равны) — аккуратно перенумеровываем весь список чистыми
+    // целыми значениями с шагом 100. Это единственный случай, когда меняется
+    // больше одного баннера.
+    renderGrid();
+    toast('Не осталось места между соседями — пересчитываю порядок всего списка…');
     try {
-      await patchBanner(item, { sortIndex: newSort });
-      toast(`Готово: sort ${newSort} — остальные баннеры не тронуты`);
+      await renumberAll(list);
+      toast('Список перенумерован целыми значениями с шагом 100');
       renderGrid();
     } catch (err) {
       toast('Ошибка сохранения порядка: ' + err.message, true);
@@ -586,14 +669,17 @@
           <button class="sob-filter-btn active" data-filter="all">Все</button>
           <button class="sob-filter-btn" data-filter="active">Активные</button>
           <button class="sob-filter-btn" data-filter="inactive">Неактивные</button>
+          <button id="sob-renumber" class="sob-filter-btn" title="Пересчитать sort у всех баннеров целыми значениями с шагом 100">Перенумеровать всё</button>
           <button id="sob-refresh" title="Обновить">⟳</button>
           <button id="sob-close" title="Закрыть">✕</button>
         </div>
         <div id="sob-hint">
           Перетащите превью, чтобы изменить порядок, либо используйте кнопки ◀▶ (недоступны при активном поиске/фильтре — порядок в них
-          относится к полному списку, а не к отфильтрованному). Новое значение sort ставится ровно между соседями (например 150 между 100
-          и 200) — <b>меняется только у перемещённого баннера</b>, у остальных значения не трогаются, какая бы схема нумерации ни была
-          на проекте раньше. Клик по «🌐 Сайт» / «📱 Прил.» переключает видимость.
+          относится к полному списку, а не к отфильтрованному). Новое целое значение sort (минимум 100) ставится ровно между соседями
+          (например 150 между 100 и 200) — <b>меняется только у перемещённого баннера</b>. Если места для целого числа между соседями не
+          осталось (например несколько баннеров с одинаковым sort) — автоматически пересчитывается весь список чистыми значениями с шагом
+          100; то же можно сделать вручную кнопкой «Перенумеровать всё». Клик по бейджу «Активен/Неактивен» переключает активность баннера,
+          клик по «🌐 Сайт» / «📱 Прил.» — видимость.
           Все изменения сохраняются как <b>неопубликованные черновики</b> (бейдж «есть черновик» на карточке) — само не публикуется,
           опубликуйте баннер вручную в студии, когда будете готовы.
         </div>
@@ -607,6 +693,20 @@
     });
     document.getElementById('sob-close').addEventListener('click', closeModal);
     document.getElementById('sob-refresh').addEventListener('click', loadAndRender);
+    document.getElementById('sob-renumber').addEventListener('click', async () => {
+      if (state.saving) return;
+      state.saving = true;
+      toast('Перенумеровываю всё…');
+      try {
+        const changed = await renumberAll(state.banners);
+        toast(changed ? 'Готово: целые значения с шагом 100 от 100' : 'Уже всё аккуратно — менять нечего');
+        renderGrid();
+      } catch (err) {
+        toast('Ошибка: ' + err.message, true);
+      } finally {
+        state.saving = false;
+      }
+    });
 
     document.getElementById('sob-search').addEventListener('input', (e) => {
       state.search = e.target.value;
