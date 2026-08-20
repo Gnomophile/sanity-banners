@@ -397,7 +397,7 @@
   .sob-tri-fill {
     position: absolute; inset: 0; background: var(--sob-accent);
     transform: translateY(-100%);
-    transition: transform .3s cubic-bezier(0.18, 0.89, 0.35, 1.15), background-color .3s ease;
+    transition: transform .5s cubic-bezier(0.22, 1, 0.36, 1), background-color .3s ease;
     z-index: 1;
   }
   .sob-tri-text { position: relative; z-index: 2; transition: color .15s ease; }
