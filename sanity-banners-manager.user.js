@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Starter Office — менеджер баннеров (Sanity)
 // @namespace    starter-office-banners
-// @version      2.10.0
+// @version      2.10.2
 // @description  Модалка с превью всех баннеров, статусами, настройками показа, drag-n-drop сортировкой и быстрым чекбокс-выбором городов/заведений (режимы «только здесь» и «везде, кроме») напрямую через Sanity Content API
 // @author       you
 // @match        https://my.starterapp.ru/*
@@ -290,6 +290,13 @@
 
   let citiesShopsCache = null; // {cities:[{_id,name}], shops:[{_id,cityId,city,street,house}]} — грузится один раз за открытие модалки
 
+  // Города без единой точки и точки без привязки к городу — это, как правило,
+  // незаполненные до конца или брошенные карточки в справочнике, а не то, чем
+  // реально управляют через баннеры. Они только загромождают список чекбоксов,
+  // поэтому в UI не показываются вовсе. Если такая запись всё же УЖЕ выбрана
+  // у какого-то баннера (banner.cityIds/shopIds) — это не теряется: см.
+  // untouchedCityIds/untouchedShopIds в openGeoModal/saveGeoModal, они
+  // проходят через сохранение как есть, в обход чекбокс-списка.
   async function fetchCitiesAndShops() {
     if (citiesShopsCache) return citiesShopsCache;
     const query = `{
@@ -302,7 +309,11 @@
         "house": address.house.ru
       }
     }`;
-    citiesShopsCache = await groqQuery(query);
+    const raw = await groqQuery(query);
+    const shops = raw.shops.filter((s) => s.cityId); // без города — не показываем
+    const usedCityIds = new Set(shops.map((s) => s.cityId));
+    const cities = raw.cities.filter((c) => usedCityIds.has(c._id)); // без точек — не показываем
+    citiesShopsCache = { cities, shops };
     return citiesShopsCache;
   }
 
@@ -738,11 +749,6 @@
   }
   #sob-geo-search:focus { border-color: var(--sob-accent); }
   #sob-geo-body { flex: 1; overflow-y: auto; padding: 10px 18px 16px; }
-  .sob-geo-group-title {
-    font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em;
-    color: var(--sob-text-tertiary); margin: 14px 0 6px;
-  }
-  .sob-geo-group-title:first-child { margin-top: 4px; }
   .sob-geo-row {
     display: flex; align-items: center; gap: 8px; padding: 6px 4px; border-radius: 6px;
     font-size: 13px; color: var(--sob-text-primary); cursor: pointer;
@@ -1183,9 +1189,17 @@
     document.body.appendChild(overlay);
     overlay.addEventListener('click', (e) => { if (e.target === overlay) closeGeoModal(); });
     document.getElementById('sob-geo-close').addEventListener('click', closeGeoModal);
+    let geoSearchTimer = null;
     document.getElementById('sob-geo-search').addEventListener('input', (e) => {
-      geoModalState.search = e.target.value;
-      renderGeoBody();
+      const value = e.target.value;
+      clearTimeout(geoSearchTimer);
+      // Небольшая задержка, чтобы при быстром наборе не перестраивать весь
+      // список чекбоксов на каждое нажатие клавиши — не критично на текущих
+      // объёмах (сотни точек), но дешёвая подстраховка на случай роста.
+      geoSearchTimer = setTimeout(() => {
+        geoModalState.search = value;
+        renderGeoBody();
+      }, 150);
     });
     document.getElementById('sob-geo-select-all').addEventListener('click', () => {
       const st = geoModalState;
@@ -1205,12 +1219,21 @@
 
     try {
       const citiesShops = await fetchCitiesAndShops();
+      // Города/точки, отфильтрованные из выдачи (см. fetchCitiesAndShops), но
+      // уже выбранные у этого баннера — оставляем как есть, не показывая
+      // чекбоксом и не давая инструменту их случайно потерять при сохранении.
+      const visibleCityIds = new Set(citiesShops.cities.map((c) => c._id));
+      const visibleShopIds = new Set(citiesShops.shops.map((s) => s._id));
+      const untouchedCityIds = banner.cityIds.filter((id) => !visibleCityIds.has(id));
+      const untouchedShopIds = banner.shopIds.filter((id) => !visibleShopIds.has(id));
       geoModalState = {
         banner,
         citiesShops,
         mode: 'show',
-        checkedCityIds: new Set(banner.cityIds),
-        checkedShopIds: new Set(banner.shopIds),
+        checkedCityIds: new Set(banner.cityIds.filter((id) => visibleCityIds.has(id))),
+        checkedShopIds: new Set(banner.shopIds.filter((id) => visibleShopIds.has(id))),
+        untouchedCityIds,
+        untouchedShopIds,
         search: '',
       };
       updateGeoHint();
@@ -1309,22 +1332,6 @@
       }
     });
 
-    const noCityShops = citiesShops.shops.filter(
-      (s) => !s.cityId && (!q || [s.city, s.street, s.house].filter(Boolean).join(' ').toLowerCase().includes(q))
-    );
-    if (noCityShops.length) {
-      rows.push(`<div class="sob-geo-group-title">Без привязки к городу</div>`);
-      noCityShops.forEach((s) => {
-        const label = [s.city, s.street, s.house].filter(Boolean).join(', ') || '(без адреса)';
-        rows.push(`
-          <label class="sob-geo-row shop">
-            <input type="checkbox" data-kind="shop" data-id="${s._id}" ${checkedShopIds.has(s._id) ? 'checked' : ''}>
-            ${label.replace(/</g, '&lt;')}
-          </label>
-        `);
-      });
-    }
-
     body.innerHTML = rows.length
       ? rows.join('')
       : `<div style="text-align:center;color:var(--sob-text-tertiary);padding:30px 0;">Ничего не найдено</div>`;
@@ -1367,7 +1374,7 @@
   }
 
   async function saveGeoModal() {
-    const { banner, mode, citiesShops, checkedCityIds, checkedShopIds } = geoModalState;
+    const { banner, mode, citiesShops, checkedCityIds, checkedShopIds, untouchedCityIds, untouchedShopIds } = geoModalState;
     let allowList;
     if (mode === 'hide') {
       allowList = computeAllowList(checkedCityIds, checkedShopIds, citiesShops);
@@ -1384,8 +1391,8 @@
     saveBtn.textContent = 'Сохраняю…';
     try {
       await patchBanner(banner, {
-        cities: toWeakRefs(allowList.cityIds),
-        shops: toWeakRefs(allowList.shopIds),
+        cities: toWeakRefs([...allowList.cityIds, ...untouchedCityIds]),
+        shops: toWeakRefs([...allowList.shopIds, ...untouchedShopIds]),
       });
       toast('Сохранено в черновик — не забудьте опубликовать в студии');
       closeGeoModal();
