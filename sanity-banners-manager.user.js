@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Starter Office — менеджер баннеров (Sanity)
 // @namespace    starter-office-banners
-// @version      2.8.0
-// @description  Модалка с превью всех баннеров, статусами, настройками показа и drag-n-drop сортировкой напрямую через Sanity Content API
+// @version      2.10.0
+// @description  Модалка с превью всех баннеров, статусами, настройками показа, drag-n-drop сортировкой и быстрым чекбокс-выбором городов/заведений (режимы «только здесь» и «везде, кроме») напрямую через Sanity Content API
 // @author       you
 // @match        https://my.starterapp.ru/*
 // @icon         https://www.sanity.io/favicon.ico
@@ -109,6 +109,9 @@
       sortIndex,
       "thumbH": backgroundImage.asset->url,
       "thumbV": verticalBackgroundImage.asset->url,
+      "cityIds": cities[]._ref,
+      "cityNames": cities[]->name.ru,
+      "shopIds": shops[]._ref,
       "venues": shops[]->{
         "city": address.city.ru,
         "street": address.street.ru,
@@ -141,22 +144,28 @@
         sortIndex: typeof current.sortIndex === 'number' ? current.sortIndex : 0,
         thumbH: current.thumbH || null,
         thumbV: current.thumbV || null,
-        venues: formatVenues(current.venues),
+        cityIds: current.cityIds || [],
+        shopIds: current.shopIds || [],
+        venues: formatVenues(current.cityNames, current.venues),
       });
     }
     banners.sort((a, b) => a.sortIndex - b.sortIndex);
     return banners;
   }
 
-  // Пустое поле «Заведения» в Sanity означает «показывать во всех заведениях» —
-  // в этом случае ничего не выводим на превью, чтобы не загромождать карточку.
-  // Если заведения указаны — собираем их адреса в короткие читаемые строки.
-  function formatVenues(rawVenues) {
-    if (!Array.isArray(rawVenues) || !rawVenues.length) return [];
-    return rawVenues
+  // Пустые поля «Города» и «Заведения» в Sanity вместе означают «показывать
+  // везде» — в этом случае ничего не выводим на превью, чтобы не загромождать
+  // карточку. Если что-то указано — собираем города и адреса точек в короткие
+  // читаемые строки (города — с пометкой, чтобы не путать с одиночной точкой).
+  function formatVenues(rawCityNames, rawVenues) {
+    const cities = (Array.isArray(rawCityNames) ? rawCityNames : [])
+      .filter(Boolean)
+      .map((name) => `${name} (город)`);
+    const shops = (Array.isArray(rawVenues) ? rawVenues : [])
       .filter(Boolean)
       .map((v) => [v.city, v.street, v.house].filter(Boolean).map((s) => String(s).trim()).join(', '))
       .filter(Boolean);
+    return [...cities, ...shops];
   }
 
   // Все изменения из этого инструмента пишутся ТОЛЬКО в черновик (drafts.<id>),
@@ -272,6 +281,122 @@
     return true;
   }
 
+  // ==================== ГОРОДА И ЗАВЕДЕНИЯ («скрыть везде, кроме») ====================
+  // Sanity хранит только БЕЛЫЙ список: banner.cities (город целиком) и
+  // banner.shops (отдельная точка); оба пустые = показывать везде. Прямого
+  // способа сказать «показывать везде, кроме» в схеме нет — поэтому этот
+  // блок держит список выбранного пользователем для СКРЫТИЯ отдельно в UI
+  // и на сохранении пересчитывает его в эквивалентный белый список.
+
+  let citiesShopsCache = null; // {cities:[{_id,name}], shops:[{_id,cityId,city,street,house}]} — грузится один раз за открытие модалки
+
+  async function fetchCitiesAndShops() {
+    if (citiesShopsCache) return citiesShopsCache;
+    const query = `{
+      "cities": *[_type=="city"] | order(coalesce(sortIndex,0) asc, name.ru asc) {_id, "name": name.ru},
+      "shops": *[_type=="shop"] | order(address.city.ru asc, address.street.ru asc) {
+        _id,
+        "cityId": address.cityRef._ref,
+        "city": address.city.ru,
+        "street": address.street.ru,
+        "house": address.house.ru
+      }
+    }`;
+    citiesShopsCache = await groqQuery(query);
+    return citiesShopsCache;
+  }
+
+  function generateRefKey() {
+    return Array.from({ length: 12 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
+  }
+
+  function toWeakRefs(ids) {
+    return ids.map((id) => ({ _type: 'reference', _ref: id, _weak: true, _key: generateRefKey() }));
+  }
+
+  // По текущему белому списку баннера (включённые города/точки) восстанавливает,
+  // что пользователь, скорее всего, имел в виду как «скрытое»: город скрыт
+  // целиком, если он не включён и ни одна его точка не включена отдельно;
+  // если часть точек города всё же включена отдельно — скрыты только
+  // оставшиеся точки этого города (а не весь город).
+  function computeHiddenSelection(banner, citiesShops) {
+    const includedCityIds = new Set(banner.cityIds);
+    const includedShopIds = new Set(banner.shopIds);
+    const hiddenCityIds = new Set();
+    const hiddenShopIds = new Set();
+
+    if (!includedCityIds.size && !includedShopIds.size) {
+      // Оба поля пустые — баннер показывается везде, скрытого нет.
+      return { hiddenCityIds, hiddenShopIds };
+    }
+
+    for (const city of citiesShops.cities) {
+      if (includedCityIds.has(city._id)) continue; // город открыт целиком
+      const shopsOfCity = citiesShops.shops.filter((s) => s.cityId === city._id);
+      const anyShopIncluded = shopsOfCity.some((s) => includedShopIds.has(s._id));
+      if (anyShopIncluded) {
+        shopsOfCity.forEach((s) => { if (!includedShopIds.has(s._id)) hiddenShopIds.add(s._id); });
+      } else {
+        hiddenCityIds.add(city._id);
+      }
+    }
+    citiesShops.shops
+      .filter((s) => !s.cityId)
+      .forEach((s) => { if (!includedShopIds.has(s._id)) hiddenShopIds.add(s._id); });
+
+    return { hiddenCityIds, hiddenShopIds };
+  }
+
+  // Обратное преобразование — из набора скрытых городов/точек собирает белый
+  // список для записи в Sanity. Возвращает null, если результат означал бы
+  // «скрыть вообще везде»: пустой белый список Sanity трактует как ровно
+  // противоположное («показывать везде»), поэтому такое состояние этим
+  // инструментом сохранить нельзя.
+  function computeAllowList(hiddenCityIds, hiddenShopIds, citiesShops) {
+    if (!hiddenCityIds.size && !hiddenShopIds.size) {
+      return { cityIds: [], shopIds: [] };
+    }
+
+    const cityIds = [];
+    const shopIds = [];
+    for (const city of citiesShops.cities) {
+      if (hiddenCityIds.has(city._id)) continue;
+      const shopsOfCity = citiesShops.shops.filter((s) => s.cityId === city._id);
+      const hasHiddenShop = shopsOfCity.some((s) => hiddenShopIds.has(s._id));
+      if (!hasHiddenShop) {
+        cityIds.push(city._id);
+      } else {
+        shopsOfCity.forEach((s) => { if (!hiddenShopIds.has(s._id)) shopIds.push(s._id); });
+      }
+    }
+    citiesShops.shops
+      .filter((s) => !s.cityId)
+      .forEach((s) => { if (!hiddenShopIds.has(s._id)) shopIds.push(s._id); });
+
+    if (!cityIds.length && !shopIds.length) return null; // скрыто буквально всё
+    return { cityIds, shopIds };
+  }
+
+  // Прямой (не инвертированный) режим «Показывать только здесь»: отмеченное —
+  // это и есть белый список, никакого пересчёта не нужно. Единственная
+  // подчистка — точки, чей город уже отмечен целиком, не дублируются в
+  // shopIds (город и так их покрывает); а если отмечено вообще всё — пишем
+  // пустые массивы, а не длинный список из всех городов, чтобы в самой
+  // студии это по-прежнему читалось как «показывать везде».
+  function buildShowAllowList(checkedCityIds, checkedShopIds, citiesShops) {
+    const cityIds = citiesShops.cities.filter((c) => checkedCityIds.has(c._id)).map((c) => c._id);
+    const shopIds = citiesShops.shops
+      .filter((s) => checkedShopIds.has(s._id) && !(s.cityId && checkedCityIds.has(s.cityId)))
+      .map((s) => s._id);
+
+    const allCitiesChecked = cityIds.length === citiesShops.cities.length;
+    const allNoCityShopsChecked = citiesShops.shops
+      .filter((s) => !s.cityId)
+      .every((s) => checkedShopIds.has(s._id));
+    if (allCitiesChecked && allNoCityShopsChecked) return { cityIds: [], shopIds: [] };
+
+    return { cityIds, shopIds };
+  }
 
   // ==================== СТИЛИ ====================
 
@@ -573,6 +698,71 @@
     display: flex; align-items: center; justify-content: center; height: 100%;
     color: var(--sob-text-secondary); font-size: 13px; transition: color .3s ease;
   }
+
+  /* Окно «Города и заведения» — второй, вложенный оверлей поверх основной
+     модалки (тот же паттерн overlay+modal, z-index выше). Один и тот же
+     чек-лист городов/точек работает в двух режимах (см. .sob-geo-mode) —
+     переключатель режима использует ту же механику флипа плашки, что и
+     .sob-tri у фильтра статуса баннеров, просто на 2 позиции вместо 3. */
+  #sob-geo-overlay {
+    position: fixed; inset: 0; background: rgba(23, 20, 14, 0.5);
+    z-index: 1000002; display: flex; align-items: center; justify-content: center;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  #sob-geo-modal {
+    background: var(--sob-bg-page); width: min(760px, 92vw); height: min(82vh, 740px);
+    border-radius: 12px; box-shadow: 0 20px 60px rgba(0,0,0,.3);
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  #sob-geo-header {
+    display: flex; align-items: center; gap: 10px; padding: 14px 18px;
+    background: var(--sob-bg-panel); border-bottom: 1px solid var(--sob-border); flex-shrink: 0;
+  }
+  #sob-geo-header h3 { font-size: 14px; margin: 0; color: var(--sob-text-primary); flex: 1; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #sob-geo-controls {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 12px 18px 0;
+  }
+  #sob-geo-mode-show:checked ~ label[for="sob-geo-mode-show"] .sob-tri-fill,
+  #sob-geo-mode-hide:checked ~ label[for="sob-geo-mode-hide"] .sob-tri-fill { transform: translateY(0); }
+  #sob-geo-mode-show:checked ~ label[for="sob-geo-mode-show"] .sob-tri-text,
+  #sob-geo-mode-hide:checked ~ label[for="sob-geo-mode-hide"] .sob-tri-text { color: #fff; }
+  #sob-geo-hint {
+    margin: 12px 18px 0; padding: 10px 12px; font-size: 12.5px; line-height: 1.5;
+    color: var(--sob-text-secondary); background: var(--sob-bg-subtle); border-radius: 8px;
+  }
+  #sob-geo-search {
+    margin: 10px 18px 0; padding: 8px 12px; border: 1px solid var(--sob-border); border-radius: 8px;
+    font-size: 13px; outline: none; background: var(--sob-bg-panel); color: var(--sob-text-primary);
+  }
+  #sob-geo-search:focus { border-color: var(--sob-accent); }
+  #sob-geo-body { flex: 1; overflow-y: auto; padding: 10px 18px 16px; }
+  .sob-geo-group-title {
+    font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em;
+    color: var(--sob-text-tertiary); margin: 14px 0 6px;
+  }
+  .sob-geo-group-title:first-child { margin-top: 4px; }
+  .sob-geo-row {
+    display: flex; align-items: center; gap: 8px; padding: 6px 4px; border-radius: 6px;
+    font-size: 13px; color: var(--sob-text-primary); cursor: pointer;
+  }
+  .sob-geo-row:hover { background: var(--sob-bg-subtle); }
+  .sob-geo-row input { flex-shrink: 0; accent-color: var(--sob-accent); width: 15px; height: 15px; }
+  .sob-geo-row.city { font-weight: 600; }
+  .sob-geo-row.shop { padding-left: 26px; color: var(--sob-text-secondary); }
+  #sob-geo-footer {
+    display: flex; align-items: center; gap: 10px; padding: 12px 18px;
+    border-top: 1px solid var(--sob-border); background: var(--sob-bg-panel); flex-shrink: 0;
+  }
+  #sob-geo-count { font-size: 12px; color: var(--sob-text-secondary); flex: 1; }
+  #sob-geo-count.warn { color: #c0362c; font-weight: 600; }
+  .sob-geo-btn-primary {
+    background: var(--sob-accent); color: #fff; border: none; border-radius: 8px;
+    padding: 8px 16px; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit;
+  }
+  .sob-geo-btn-primary:hover { background: var(--sob-accent-hover); }
+  .sob-geo-btn-primary:disabled { opacity: .5; cursor: default; }
   `;
 
   function injectStyle() {
@@ -681,6 +871,7 @@
           <div class="sob-toggles">
             <div class="sob-toggle site ${banner.showInWeb ? 'on' : ''}">${ICON_WEBSITE} Сайт</div>
             <div class="sob-toggle app ${banner.showInApplication ? 'on' : ''}">${ICON_MOBILE} Прил.</div>
+            <div class="sob-toggle geo" title="Города и заведения">${ICON_PIN} Гео</div>
             <div class="sob-sortval">Сорт.: ${formatSort(banner.sortIndex)}</div>
           </div>
           <div class="sob-sortrow">
@@ -701,6 +892,10 @@
       card.querySelector('.sob-toggle.app').addEventListener('click', (e) => {
         e.stopPropagation();
         toggleField(banner, 'showInApplication');
+      });
+      card.querySelector('.sob-toggle.geo').addEventListener('click', (e) => {
+        e.stopPropagation();
+        openGeoModal(banner);
       });
 
       card.querySelector('.sob-move-btn.up').addEventListener('click', (e) => {
@@ -889,7 +1084,10 @@
       if (e.target === overlay) closeModal();
     });
     document.getElementById('sob-close').addEventListener('click', closeModal);
-    document.getElementById('sob-refresh').addEventListener('click', loadAndRender);
+    document.getElementById('sob-refresh').addEventListener('click', () => {
+      citiesShopsCache = null; // на «Обновить» также подтягиваем свежий список городов/точек
+      loadAndRender();
+    });
     const themeInput = document.getElementById('sob-theme-toggle');
     themeInput.checked = getStoredTheme() === 'dark';
     themeInput.addEventListener('change', () => {
@@ -940,6 +1138,265 @@
     document.removeEventListener('keydown', escListener);
   }
 
+  // ==================== ОКНО «ГОРОДА И ЗАВЕДЕНИЯ» ====================
+  // Один и тот же чек-лист городов/точек работает в двух режимах:
+  //  - "show" — прямой белый список («показывать только здесь»);
+  //  - "hide" — инвертированный («показывать везде, кроме отмеченного»).
+  // checkedCityIds/checkedShopIds хранят именно то, что отмечено галочками —
+  // смысл этих отметок (включить или исключить) зависит только от режима.
+  // При переключении режима отметки пересчитываются через те же функции
+  // computeHiddenSelection/computeAllowList, что и при сохранении — так
+  // выбор не теряется, когда передумал на середине.
+
+  let geoModalState = null; // { banner, citiesShops, mode, checkedCityIds, checkedShopIds, search }
+
+  async function openGeoModal(banner) {
+    if (document.getElementById('sob-geo-overlay')) return;
+
+    const overlay = document.createElement('div');
+    overlay.id = 'sob-geo-overlay';
+    overlay.innerHTML = `
+      <div id="sob-geo-modal">
+        <div id="sob-geo-header">
+          <h3>Города и заведения — «${banner.title.replace(/</g, '&lt;')}»</h3>
+          <button id="sob-geo-close" class="sob-filter-btn" title="Закрыть">✕</button>
+        </div>
+        <div id="sob-geo-controls">
+          <div class="sob-tri">
+            <input type="radio" name="sob-geo-mode-radio" id="sob-geo-mode-show" checked>
+            <input type="radio" name="sob-geo-mode-radio" id="sob-geo-mode-hide">
+            <label for="sob-geo-mode-show" class="sob-tri-opt"><span class="sob-tri-fill"></span><span class="sob-tri-text">Показывать только здесь</span></label>
+            <label for="sob-geo-mode-hide" class="sob-tri-opt"><span class="sob-tri-fill"></span><span class="sob-tri-text">Показывать везде, кроме</span></label>
+          </div>
+          <button id="sob-geo-select-all" class="sob-filter-btn">Отметить всё</button>
+          <button id="sob-geo-select-none" class="sob-filter-btn">Снять всё</button>
+        </div>
+        <div id="sob-geo-hint"></div>
+        <input id="sob-geo-search" type="text" placeholder="Поиск по городу или адресу…" />
+        <div id="sob-geo-body"><div id="sob-loading">Загружаю города и точки…</div></div>
+        <div id="sob-geo-footer">
+          <span id="sob-geo-count"></span>
+          <button id="sob-geo-save" class="sob-geo-btn-primary" disabled>Сохранить</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) closeGeoModal(); });
+    document.getElementById('sob-geo-close').addEventListener('click', closeGeoModal);
+    document.getElementById('sob-geo-search').addEventListener('input', (e) => {
+      geoModalState.search = e.target.value;
+      renderGeoBody();
+    });
+    document.getElementById('sob-geo-select-all').addEventListener('click', () => {
+      const st = geoModalState;
+      st.citiesShops.cities.forEach((c) => st.checkedCityIds.add(c._id));
+      st.citiesShops.shops.forEach((s) => st.checkedShopIds.add(s._id));
+      renderGeoBody();
+    });
+    document.getElementById('sob-geo-select-none').addEventListener('click', () => {
+      geoModalState.checkedCityIds.clear();
+      geoModalState.checkedShopIds.clear();
+      renderGeoBody();
+    });
+    document.getElementById('sob-geo-mode-show').addEventListener('change', () => switchGeoMode('show'));
+    document.getElementById('sob-geo-mode-hide').addEventListener('change', () => switchGeoMode('hide'));
+    document.getElementById('sob-geo-save').addEventListener('click', saveGeoModal);
+    document.addEventListener('keydown', geoEscListener);
+
+    try {
+      const citiesShops = await fetchCitiesAndShops();
+      geoModalState = {
+        banner,
+        citiesShops,
+        mode: 'show',
+        checkedCityIds: new Set(banner.cityIds),
+        checkedShopIds: new Set(banner.shopIds),
+        search: '',
+      };
+      updateGeoHint();
+      renderGeoBody();
+    } catch (err) {
+      document.getElementById('sob-geo-body').innerHTML =
+        `<div id="sob-loading">Ошибка загрузки: ${err.message}</div>`;
+    }
+  }
+
+  function geoEscListener(e) {
+    if (e.key === 'Escape') closeGeoModal();
+  }
+
+  function closeGeoModal() {
+    const overlay = document.getElementById('sob-geo-overlay');
+    if (overlay) overlay.remove();
+    document.removeEventListener('keydown', geoEscListener);
+    geoModalState = null;
+  }
+
+  function switchGeoMode(newMode) {
+    const st = geoModalState;
+    if (!st || st.mode === newMode) return;
+
+    if (newMode === 'hide') {
+      // show -> hide: то, что было отмечено как «показывать», переводим
+      // в эквивалентное «что скрыто» — тем же способом, каким читаем
+      // существующие данные баннера при открытии окна.
+      const fakeBanner = { cityIds: [...st.checkedCityIds], shopIds: [...st.checkedShopIds] };
+      const { hiddenCityIds, hiddenShopIds } = computeHiddenSelection(fakeBanner, st.citiesShops);
+      st.checkedCityIds = hiddenCityIds;
+      st.checkedShopIds = hiddenShopIds;
+    } else {
+      // hide -> show: наоборот, разворачиваем «что скрыто» в белый список.
+      const allowList = computeAllowList(st.checkedCityIds, st.checkedShopIds, st.citiesShops);
+      if (allowList === null) {
+        // «Скрыто вообще всё» нельзя представить как непустой белый список —
+        // осмысленного перевода нет, начинаем с чистого листа в новом режиме.
+        toast('Состояние «скрыто всё» нельзя показать как список «только здесь» — отметьте заново.', true);
+        st.checkedCityIds = new Set();
+        st.checkedShopIds = new Set();
+      } else {
+        st.checkedCityIds = new Set(allowList.cityIds);
+        st.checkedShopIds = new Set(allowList.shopIds);
+      }
+    }
+
+    st.mode = newMode;
+    updateGeoHint();
+    renderGeoBody();
+  }
+
+  function updateGeoHint() {
+    const hint = document.getElementById('sob-geo-hint');
+    if (!hint) return;
+    hint.innerHTML = geoModalState.mode === 'show'
+      ? 'Отметьте города и точки, где баннер <b>должен</b> показываться. Если не отмечено ничего — показывается везде.'
+      : 'Отметьте города и точки, где баннер <b>не должен</b> показываться — остальные включатся автоматически.';
+  }
+
+  function renderGeoBody() {
+    if (!geoModalState) return;
+    const { citiesShops, checkedCityIds, checkedShopIds, search } = geoModalState;
+    const body = document.getElementById('sob-geo-body');
+    const q = search.trim().toLowerCase();
+
+    const rows = [];
+    citiesShops.cities.forEach((city) => {
+      const shopsOfCity = citiesShops.shops.filter((s) => s.cityId === city._id);
+      const cityMatches = !q || city.name.toLowerCase().includes(q);
+      const matchingShops = shopsOfCity.filter(
+        (s) => !q || cityMatches || [s.city, s.street, s.house].filter(Boolean).join(' ').toLowerCase().includes(q)
+      );
+      if (!cityMatches && !matchingShops.length) return;
+
+      rows.push(`
+        <label class="sob-geo-row city">
+          <input type="checkbox" data-kind="city" data-id="${city._id}" ${checkedCityIds.has(city._id) ? 'checked' : ''}>
+          ${city.name.replace(/</g, '&lt;')}
+        </label>
+      `);
+      // Точки города имеет смысл показывать точечно только когда сам город не
+      // отмечен целиком (иначе это лишний шум — они и так уже все включены
+      // или все скрыты вместе с городом, в зависимости от режима).
+      if (!checkedCityIds.has(city._id)) {
+        (cityMatches ? shopsOfCity : matchingShops).forEach((s) => {
+          const label = [s.street, s.house].filter(Boolean).join(', ') || '(без адреса)';
+          rows.push(`
+            <label class="sob-geo-row shop">
+              <input type="checkbox" data-kind="shop" data-id="${s._id}" ${checkedShopIds.has(s._id) ? 'checked' : ''}>
+              ${label.replace(/</g, '&lt;')}
+            </label>
+          `);
+        });
+      }
+    });
+
+    const noCityShops = citiesShops.shops.filter(
+      (s) => !s.cityId && (!q || [s.city, s.street, s.house].filter(Boolean).join(' ').toLowerCase().includes(q))
+    );
+    if (noCityShops.length) {
+      rows.push(`<div class="sob-geo-group-title">Без привязки к городу</div>`);
+      noCityShops.forEach((s) => {
+        const label = [s.city, s.street, s.house].filter(Boolean).join(', ') || '(без адреса)';
+        rows.push(`
+          <label class="sob-geo-row shop">
+            <input type="checkbox" data-kind="shop" data-id="${s._id}" ${checkedShopIds.has(s._id) ? 'checked' : ''}>
+            ${label.replace(/</g, '&lt;')}
+          </label>
+        `);
+      });
+    }
+
+    body.innerHTML = rows.length
+      ? rows.join('')
+      : `<div style="text-align:center;color:var(--sob-text-tertiary);padding:30px 0;">Ничего не найдено</div>`;
+
+    body.querySelectorAll('input[type="checkbox"]').forEach((input) => {
+      input.addEventListener('change', () => {
+        const set = input.dataset.kind === 'city' ? checkedCityIds : checkedShopIds;
+        if (input.checked) set.add(input.dataset.id);
+        else set.delete(input.dataset.id);
+        if (input.dataset.kind === 'city') renderGeoBody(); // город раскрыл/спрятал свои точки в списке
+        else updateGeoFooter();
+      });
+    });
+    updateGeoFooter();
+  }
+
+  function updateGeoFooter() {
+    const { mode, citiesShops, checkedCityIds, checkedShopIds } = geoModalState;
+    const cityCount = checkedCityIds.size;
+    const shopCount = checkedShopIds.size;
+    const countEl = document.getElementById('sob-geo-count');
+    const saveBtn = document.getElementById('sob-geo-save');
+
+    if (mode === 'hide' && (cityCount || shopCount) && computeAllowList(checkedCityIds, checkedShopIds, citiesShops) === null) {
+      countEl.textContent = '⚠ Нельзя скрыть баннер вообще везде — снимите хотя бы одну отметку';
+      countEl.classList.add('warn');
+      saveBtn.disabled = true;
+      return;
+    }
+    countEl.classList.remove('warn');
+
+    if (!cityCount && !shopCount) {
+      countEl.textContent = mode === 'hide'
+        ? 'Ничего не скрыто — баннер будет показываться везде'
+        : 'Ничего не отмечено — баннер будет показываться везде';
+    } else {
+      countEl.textContent = (mode === 'hide' ? 'Скрыто' : 'Показывается') + `: городов — ${cityCount}, точек — ${shopCount}`;
+    }
+    saveBtn.disabled = false;
+  }
+
+  async function saveGeoModal() {
+    const { banner, mode, citiesShops, checkedCityIds, checkedShopIds } = geoModalState;
+    let allowList;
+    if (mode === 'hide') {
+      allowList = computeAllowList(checkedCityIds, checkedShopIds, citiesShops);
+      if (allowList === null) {
+        toast('Так нельзя скрыть баннер вообще везде — пустой список Sanity читает как «показывать везде». Выключите переключатель «Активный», «Сайт» или «Прил.», если нужно скрыть баннер полностью.', true);
+        return;
+      }
+    } else {
+      allowList = buildShowAllowList(checkedCityIds, checkedShopIds, citiesShops);
+    }
+
+    const saveBtn = document.getElementById('sob-geo-save');
+    saveBtn.disabled = true;
+    saveBtn.textContent = 'Сохраняю…';
+    try {
+      await patchBanner(banner, {
+        cities: toWeakRefs(allowList.cityIds),
+        shops: toWeakRefs(allowList.shopIds),
+      });
+      toast('Сохранено в черновик — не забудьте опубликовать в студии');
+      closeGeoModal();
+      await loadAndRender(); // подтянуть свежие cityIds/shopIds/venues для карточки
+    } catch (err) {
+      toast('Ошибка сохранения: ' + err.message, true);
+      saveBtn.disabled = false;
+      saveBtn.textContent = 'Сохранить';
+    }
+  }
+
   // ==================== КНОПКА В ШАПКЕ (рядом со Schedules) ====================
   // Studio — это SPA: переход между Structure/Vision/Media/Schedules и между
   // баннерами не перезагружает страницу, поэтому кнопку нужно постоянно
@@ -971,6 +1428,7 @@
   const ICON_ARROW_RIGHT = '<svg viewBox="3 3 18 18" width="20" height="20" aria-hidden="true"><path d="M13 15L16 12M16 12L13 9M16 12H8M7.2 20H16.8C17.9201 20 18.4802 20 18.908 19.782C19.2843 19.5903 19.5903 19.2843 19.782 18.908C20 18.4802 20 17.9201 20 16.8V7.2C20 6.0799 20 5.51984 19.782 5.09202C19.5903 4.71569 19.2843 4.40973 18.908 4.21799C18.4802 4 17.9201 4 16.8 4H7.2C6.0799 4 5.51984 4 5.09202 4.21799C4.71569 4.40973 4.40973 4.71569 4.21799 5.09202C4 5.51984 4 6.07989 4 7.2V16.8C4 17.9201 4 18.4802 4.21799 18.908C4.40973 19.2843 4.71569 19.5903 5.09202 19.782C5.51984 20 6.07989 20 7.2 20Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>';
   const ICON_WEBSITE = '<svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" transform="translate(3,4)"><rect x="7" y="12" width="5" height="4.5"/><rect x="0" y="0" width="19" height="12" rx="1"/><line x1="8.5" y1="9.5" x2="10.5" y2="9.5"/><line x1="4.5" y1="16.5" x2="14.5" y2="16.5"/></g></svg>';
   const ICON_MOBILE = '<svg viewBox="0 0 32 32" width="12" height="12" aria-hidden="true"><path fill="currentColor" d="M22 1.25h-12c-1.518 0.002-2.748 1.232-2.75 2.75v24c0.002 1.518 1.232 2.748 2.75 2.75h12c1.518-0.002 2.748-1.232 2.75-2.75v-24c-0.002-1.518-1.232-2.748-2.75-2.75h-0zM23.25 28c-0.001 0.69-0.56 1.249-1.25 1.25h-12c-0.69-0.001-1.249-0.56-1.25-1.25v-24c0.001-0.69 0.56-1.249 1.25-1.25h12c0.69 0.001 1.249 0.56 1.25 1.25v0zM15.3 25.299c-0.185 0.173-0.3 0.418-0.3 0.69 0 0.004 0 0.008 0 0.012v-0.001c-0 0.004-0 0.009-0 0.014 0 0.277 0.115 0.527 0.3 0.704l0 0c0.176 0.185 0.424 0.301 0.7 0.301s0.524-0.115 0.699-0.3l0-0c0.186-0.178 0.301-0.429 0.301-0.706 0-0.004-0-0.009-0-0.013v0.001c0-0.003 0-0.007 0-0.010 0-0.273-0.116-0.518-0.3-0.69l-0.001-0.001c-0.181-0.176-0.427-0.284-0.7-0.284s-0.519 0.108-0.7 0.284l0-0z"/></svg>';
+  const ICON_PIN = '<svg viewBox="0 0 24 24" width="12" height="12" aria-hidden="true"><path fill="currentColor" d="M12 2C7.86 2 4.5 5.36 4.5 9.5c0 5.25 6.5 12 7 12.5.5-.5 7-7.25 7-12.5C18.5 5.36 15.14 2 12 2zm0 10.25a2.75 2.75 0 1 1 0-5.5 2.75 2.75 0 0 1 0 5.5z"/></svg>';
 
   // Тема хранится в localStorage и переживает переоткрытие модалки.
   const THEME_KEY = 'sob-theme';
